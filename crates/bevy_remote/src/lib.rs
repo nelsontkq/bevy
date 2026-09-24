@@ -354,11 +354,11 @@
 //!
 //! List all registered components or all components present on an entity.
 //!
-//! When `params` is not provided, this lists all registered components. If `params` is provided,
+//! When `entity` is not provided, this lists all registered components. If `entity` is provided,
 //! this lists only those components present on the provided entity.
 //!
-//! `params` (optional):
-//! - `entity`: The ID of the entity whose components will be listed.
+//! `params`:
+//! - `entity` (optional): The ID of the entity whose components will be listed.
 //!
 //! `result`: An array of fully-qualified type names of components.
 //!
@@ -513,19 +513,24 @@
 //! }
 //! ```
 //!
-//! The handler is expected to be a system-convertible function which takes optional JSON parameters
+//! The handler is expected to be a system-convertible function which takes JSON parameters
 //! as input and returns a [`BrpResult`]. This means that it should have a type signature which looks
 //! something like this:
 //! ```
-//! # use serde_json::Value;
 //! # use bevy_ecs::prelude::{In, World};
+//! # use bevy_reflect::Reflect;
 //! # use bevy_remote::BrpResult;
-//! fn handler(In(params): In<Option<Value>>, world: &mut World) -> BrpResult {
+//! #[derive(Reflect)]
+//! struct CoolParams {
+//!     coolness: u32,
+//! }
+//!
+//! fn handler(In(params): In<CoolParams>, world: &mut World) -> BrpResult {
 //!     todo!()
 //! }
 //! ```
 //!
-//! Arbitrary system parameters can be used in conjunction with the optional `Value` input. The
+//! Arbitrary system parameters can be used in conjunction with the params input. The
 //! handler system will always run with exclusive `World` access.
 //!
 //! [the `serde` documentation]: https://serde.rs/
@@ -537,6 +542,7 @@ extern crate alloc;
 use async_channel::{Receiver, Sender};
 use bevy_app::{prelude::*, MainScheduleOrder};
 use bevy_derive::{Deref, DerefMut};
+use bevy_ecs::reflect::AppTypeRegistry;
 use bevy_ecs::{
     entity::Entity,
     observer::On,
@@ -545,10 +551,14 @@ use bevy_ecs::{
         InternedScheduleLabel, IntoScheduleConfigs, ScheduleBuildMetadata, ScheduleBuilt,
         ScheduleLabel, SystemSet,
     },
-    system::{Commands, In, IntoSystem, ResMut, System, SystemId},
+    system::{Commands, In, IntoSystem, ResMut, SystemId},
     world::World,
 };
 use bevy_platform::collections::HashMap;
+use bevy_reflect::{
+    serde::TypedReflectSerializer, FromReflect, GetTypeRegistration, PartialReflect, TypeInfo,
+    TypeRegistry, Typed,
+};
 #[cfg(feature = "bevy_render")]
 use bevy_render::{Render, RenderApp, RenderScheduleOrder, RenderStartup};
 use bevy_utils::prelude::default;
@@ -559,7 +569,10 @@ use std::sync::RwLock;
 pub mod builtin_methods;
 #[cfg(feature = "http")]
 pub mod http;
+mod json;
 pub mod schemas;
+
+pub use json::Json;
 
 const CHANNEL_SIZE: usize = 16;
 
@@ -571,9 +584,14 @@ const CHANNEL_SIZE: usize = 16;
 /// [crate-level documentation]: crate
 pub struct RemotePlugin {
     /// The verbs that the server will recognize and respond to for the main app.
-    methods: RwLock<Vec<(String, RemoteMethodHandler)>>,
+    methods: RwLock<Vec<MethodRegistration>>,
     /// The verbs that the server will recognize and respond to for the render subapp.
-    render_methods: RwLock<Vec<(String, RemoteMethodHandler)>>,
+    render_methods: RwLock<Vec<MethodRegistration>>,
+}
+
+struct MethodRegistration {
+    name: String,
+    register: Box<dyn FnOnce(&mut World) -> RemoteMethod + Send + Sync>,
 }
 
 impl RemotePlugin {
@@ -588,83 +606,109 @@ impl RemotePlugin {
 
     /// Add a remote method to the plugin using the given `name` and `handler` to main app.
     #[inline]
-    pub fn with_method_main<M>(
+    pub fn with_method_main<P, PM, R, RM, M>(
         self,
         name: impl Into<String>,
-        handler: impl IntoSystem<In<Option<Value>>, BrpResult, M>,
-    ) -> Self {
+        handler: impl IntoSystem<In<P>, BrpResult<R>, M>,
+    ) -> Self
+    where
+        P: MethodParams<PM>,
+        R: MethodResponse<RM>,
+    {
         self.with_method(name, handler, true)
     }
 
     /// Add a remote method to the plugin using the given `name` and `handler` to render app.
     #[inline]
-    pub fn with_method_render<M>(
+    pub fn with_method_render<P, PM, R, RM, M>(
         self,
         name: impl Into<String>,
-        handler: impl IntoSystem<In<Option<Value>>, BrpResult, M>,
-    ) -> Self {
+        handler: impl IntoSystem<In<P>, BrpResult<R>, M>,
+    ) -> Self
+    where
+        P: MethodParams<PM>,
+        R: MethodResponse<RM>,
+    {
         self.with_method(name, handler, false)
     }
 
     /// Add a remote method to the plugin using the given `name` and `handler` to given app.
     #[must_use]
-    fn with_method<M>(
+    fn with_method<P, PM, R, RM, M>(
         mut self,
         name: impl Into<String>,
-        handler: impl IntoSystem<In<Option<Value>>, BrpResult, M>,
+        handler: impl IntoSystem<In<P>, BrpResult<R>, M>,
         to_main: bool,
-    ) -> Self {
+    ) -> Self
+    where
+        P: MethodParams<PM>,
+        R: MethodResponse<RM>,
+    {
+        let system = IntoSystem::into_system(handler);
         (if to_main {
             self.methods.get_mut()
         } else {
             self.render_methods.get_mut()
         })
         .unwrap()
-        .push((
-            name.into(),
-            RemoteMethodHandler::Instant(Box::new(IntoSystem::into_system(handler))),
-        ));
+        .push(MethodRegistration {
+            name: name.into(),
+            register: Box::new(move |world| RemoteMethod::instant(world, system)),
+        });
         self
     }
 
     /// Add a remote method with a watching handler to the plugin using the given `name` to main app.
     #[inline]
-    pub fn with_watching_method_main<M>(
+    pub fn with_watching_method_main<P, PM, R, RM, M>(
         self,
         name: impl Into<String>,
-        handler: impl IntoSystem<In<Option<Value>>, BrpResult<Option<Value>>, M>,
-    ) -> Self {
+        handler: impl IntoSystem<In<P>, BrpResult<Option<R>>, M>,
+    ) -> Self
+    where
+        P: MethodParams<PM>,
+        R: MethodResponse<RM>,
+    {
         self.with_watching_method(name, handler, true)
     }
 
     /// Add a remote method with a watching handler to the plugin using the given `name` to render app.
     #[inline]
-    pub fn with_watching_method_render<M>(
+    pub fn with_watching_method_render<P, PM, R, RM, M>(
         self,
         name: impl Into<String>,
-        handler: impl IntoSystem<In<Option<Value>>, BrpResult<Option<Value>>, M>,
-    ) -> Self {
+        handler: impl IntoSystem<In<P>, BrpResult<Option<R>>, M>,
+    ) -> Self
+    where
+        P: MethodParams<PM>,
+        R: MethodResponse<RM>,
+    {
         self.with_watching_method(name, handler, false)
     }
 
     /// Add a remote method with a watching handler to the plugin using the given `name` to given app.
     #[must_use]
-    fn with_watching_method<M>(
+    fn with_watching_method<P, PM, R, RM, M>(
         mut self,
         name: impl Into<String>,
-        handler: impl IntoSystem<In<Option<Value>>, BrpResult<Option<Value>>, M>,
+        handler: impl IntoSystem<In<P>, BrpResult<Option<R>>, M>,
         to_main: bool,
-    ) -> Self {
+    ) -> Self
+    where
+        P: MethodParams<PM>,
+        R: MethodResponse<RM>,
+    {
+        let system = IntoSystem::into_system(handler);
         (if to_main {
             self.methods.get_mut()
         } else {
             self.render_methods.get_mut()
         })
         .unwrap()
-        .push((
-            name.into(),
-            RemoteMethodHandler::Watching(Box::new(IntoSystem::into_system(handler))),
-        ));
+        .push(MethodRegistration {
+            name: name.into(),
+            register: Box::new(move |world| RemoteMethod::watching(world, system)),
+        });
         self
     }
 
@@ -807,18 +851,8 @@ impl Plugin for RemotePlugin {
         let mut remote_methods = RemoteMethods::new();
 
         let plugin_methods = &mut *self.methods.write().unwrap();
-        for (name, handler) in plugin_methods.drain(..) {
-            remote_methods.insert(
-                name.clone(),
-                match handler {
-                    RemoteMethodHandler::Instant(system) => RemoteMethodSystemId::Instant(
-                        app.main_mut().world_mut().register_boxed_system(system),
-                    ),
-                    RemoteMethodHandler::Watching(system) => RemoteMethodSystemId::Watching(
-                        app.main_mut().world_mut().register_boxed_system(system),
-                    ),
-                },
-            );
+        for MethodRegistration { name, register } in plugin_methods.drain(..) {
+            remote_methods.insert(name, register(app.main_mut().world_mut()));
         }
 
         if remote_methods
@@ -864,18 +898,8 @@ impl Plugin for RemotePlugin {
             let mut render_remote_methods = RemoteMethods::new();
 
             let render_plugin_methods = &mut *self.render_methods.write().unwrap();
-            for (name, handler) in render_plugin_methods.drain(..) {
-                render_remote_methods.insert(
-                    name,
-                    match handler {
-                        RemoteMethodHandler::Instant(system) => RemoteMethodSystemId::Instant(
-                            render_app.world_mut().register_boxed_system(system),
-                        ),
-                        RemoteMethodHandler::Watching(system) => RemoteMethodSystemId::Watching(
-                            render_app.world_mut().register_boxed_system(system),
-                        ),
-                    },
-                );
+            for MethodRegistration { name, register } in render_plugin_methods.drain(..) {
+                render_remote_methods.insert(name, register(render_app.world_mut()));
             }
 
             render_app
@@ -921,13 +945,96 @@ pub enum RemoteSystems {
     Cleanup,
 }
 
-/// A type to hold the allowed types of systems to be used as method handlers.
-#[derive(Debug)]
-pub enum RemoteMethodHandler {
-    /// A handler that only runs once and returns one response.
-    Instant(Box<dyn System<In = In<Option<Value>>, Out = BrpResult>>),
-    /// A handler that watches for changes and response when a change is detected.
-    Watching(Box<dyn System<In = In<Option<Value>>, Out = BrpResult<Option<Value>>>>),
+/// The parameter type of a remote method handler: either a `Reflect` type or raw `Option<Value>`.
+pub trait MethodParams<Marker>: Sized + 'static {
+    /// The [`TypeInfo`] used to describe the params in `rpc.discover`, or `None` for raw JSON.
+    fn type_info() -> Option<&'static TypeInfo>;
+
+    /// Registers the params type so it can be parsed.
+    fn register(registry: &mut TypeRegistry);
+
+    /// Parses the request's `params`.
+    fn parse(params: Option<Value>, registry: &TypeRegistry) -> Result<Self, BrpError>;
+}
+
+/// [`MethodParams`] marker for raw `Option<Value>` params.
+pub struct JsonParams;
+
+/// [`MethodParams`] marker for reflected params.
+pub struct ReflectParams;
+
+impl MethodParams<JsonParams> for Option<Value> {
+    fn type_info() -> Option<&'static TypeInfo> {
+        None
+    }
+
+    fn register(_registry: &mut TypeRegistry) {}
+
+    fn parse(params: Option<Value>, _registry: &TypeRegistry) -> Result<Self, BrpError> {
+        Ok(params)
+    }
+}
+
+impl<T: FromReflect + GetTypeRegistration + Typed> MethodParams<ReflectParams> for T {
+    fn type_info() -> Option<&'static TypeInfo> {
+        Some(T::type_info())
+    }
+
+    fn register(registry: &mut TypeRegistry) {
+        registry.register::<T>();
+    }
+
+    fn parse(params: Option<Value>, registry: &TypeRegistry) -> Result<Self, BrpError> {
+        builtin_methods::parse_params(params, registry)
+    }
+}
+
+/// The success value of a remote method handler: either a `Reflect` type or raw [`Value`].
+pub trait MethodResponse<Marker>: Send + Sync + 'static {
+    /// The [`TypeInfo`] used to describe the response in `rpc.discover`, or `None` for raw JSON.
+    fn type_info() -> Option<&'static TypeInfo>;
+
+    /// Registers the response type so it can be serialized.
+    fn register(registry: &mut TypeRegistry);
+
+    /// Converts the response to JSON.
+    fn into_json(self, registry: &TypeRegistry) -> BrpResult;
+}
+
+/// [`MethodResponse`] marker for raw [`serde_json::Value`] responses.
+pub struct JsonResponse;
+
+/// [`MethodResponse`] marker for reflected responses.
+pub struct ReflectResponse;
+
+impl MethodResponse<JsonResponse> for Value {
+    fn type_info() -> Option<&'static TypeInfo> {
+        None
+    }
+
+    fn register(_registry: &mut TypeRegistry) {}
+
+    fn into_json(self, _registry: &TypeRegistry) -> BrpResult {
+        Ok(self)
+    }
+}
+
+impl<T> MethodResponse<ReflectResponse> for T
+where
+    T: PartialReflect + Typed + GetTypeRegistration + Send + Sync,
+{
+    fn type_info() -> Option<&'static TypeInfo> {
+        Some(T::type_info())
+    }
+
+    fn register(registry: &mut TypeRegistry) {
+        registry.register::<T>();
+    }
+
+    fn into_json(self, registry: &TypeRegistry) -> BrpResult {
+        serde_json::to_value(TypedReflectSerializer::new(&self, registry))
+            .map_err(BrpError::internal)
+    }
 }
 
 /// The [`SystemId`] of a function that implements a remote instant method (`world.get_components`, `world.query`, etc.)
@@ -958,11 +1065,102 @@ pub enum RemoteMethodSystemId {
     Watching(RemoteWatchingMethodSystemId),
 }
 
+/// A remote method registered in [`RemoteMethods`].
+#[derive(Debug, Clone, Copy)]
+pub struct RemoteMethod {
+    /// Parses the params, then runs the handler.
+    pub system: RemoteMethodSystemId,
+    /// The [`TypeInfo`] of the handler's [`MethodParams`], or `None` for raw JSON.
+    pub params: Option<&'static TypeInfo>,
+    /// The [`TypeInfo`] of the handler's [`MethodResponse`], or `None` for raw JSON.
+    pub result: Option<&'static TypeInfo>,
+}
+
+impl RemoteMethod {
+    /// Creates a method that runs once and sends a single response.
+    pub fn instant<P, PM, R, RM, M>(
+        world: &mut World,
+        handler: impl IntoSystem<In<P>, BrpResult<R>, M> + 'static,
+    ) -> Self
+    where
+        P: MethodParams<PM>,
+        R: MethodResponse<RM>,
+    {
+        let system = register_adapter::<P, PM, R, RM, _, _, M>(world, handler, R::into_json);
+        Self {
+            system: RemoteMethodSystemId::Instant(system),
+            params: P::type_info(),
+            result: R::type_info(),
+        }
+    }
+
+    /// Creates a method that keeps running and responds whenever something changes.
+    pub fn watching<P, PM, R, RM, M>(
+        world: &mut World,
+        handler: impl IntoSystem<In<P>, BrpResult<Option<R>>, M> + 'static,
+    ) -> Self
+    where
+        P: MethodParams<PM>,
+        R: MethodResponse<RM>,
+    {
+        let system =
+            register_adapter::<P, PM, R, RM, _, _, M>(world, handler, |response, registry| {
+                response.map(|r| r.into_json(registry)).transpose()
+            });
+        Self {
+            system: RemoteMethodSystemId::Watching(system),
+            params: P::type_info(),
+            result: R::type_info(),
+        }
+    }
+}
+
+/// Registers `handler` behind a system that parses its params and serializes its output.
+fn register_adapter<P, PM, R, RM, O, J, M>(
+    world: &mut World,
+    handler: impl IntoSystem<In<P>, BrpResult<O>, M> + 'static,
+    into_json: fn(O, &TypeRegistry) -> BrpResult<J>,
+) -> SystemId<In<Option<Value>>, BrpResult<J>>
+where
+    P: MethodParams<PM>,
+    R: MethodResponse<RM>,
+    O: 'static,
+    J: 'static,
+{
+    {
+        let registry = world.get_resource_or_init::<AppTypeRegistry>();
+        let mut registry = registry.write();
+        P::register(&mut registry);
+        R::register(&mut registry);
+    }
+    let inner = world.register_system(handler);
+    world.register_system(
+        move |In(params): In<Option<Value>>, world: &mut World| -> BrpResult<J> {
+            let params = P::parse(params, &world.resource::<AppTypeRegistry>().read())?;
+            let output = world
+                .run_system_with(inner, params)
+                .map_err(BrpError::internal)??;
+            into_json(output, &world.resource::<AppTypeRegistry>().read())
+        },
+    )
+}
+
+impl From<RemoteMethodSystemId> for RemoteMethod {
+    /// Wraps a raw handler, which is not described in `rpc.discover`.
+    fn from(system: RemoteMethodSystemId) -> Self {
+        Self {
+            system,
+            params: None,
+            result: None,
+        }
+    }
+}
+
 /// Holds all implementations of methods known to the server.
 ///
 /// Custom methods can be added to this list using [`RemoteMethods::insert`].
 #[derive(Debug, Resource, Default)]
-pub struct RemoteMethods(HashMap<String, RemoteMethodSystemId>);
+pub struct RemoteMethods(HashMap<String, RemoteMethod>);
 
 impl RemoteMethods {
     /// Creates a new [`RemoteMethods`] resource with no methods registered in it.
@@ -972,18 +1170,23 @@ impl RemoteMethods {
 
     /// Adds a new method, replacing any existing method with that name.
     ///
-    /// If there was an existing method with that name, returns its handler.
+    /// If there was an existing method with that name, returns it.
     pub fn insert(
         &mut self,
         method_name: impl Into<String>,
-        handler: RemoteMethodSystemId,
-    ) -> Option<RemoteMethodSystemId> {
-        self.0.insert(method_name.into(), handler)
+        method: impl Into<RemoteMethod>,
+    ) -> Option<RemoteMethod> {
+        self.0.insert(method_name.into(), method.into())
     }
 
     /// Get a [`RemoteMethodSystemId`] with its method name.
     pub fn get(&self, method: &str) -> Option<&RemoteMethodSystemId> {
-        self.0.get(method)
+        self.0.get(method).map(|method| &method.system)
+    }
+
+    /// Iterates over the registered methods and their names.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &RemoteMethod)> {
+        self.0.iter().map(|(name, method)| (name.as_str(), method))
     }
 
     /// Get a [`Vec<String>`] with method names.
@@ -1050,6 +1253,21 @@ pub struct BrpRequest {
     /// These are passed as the first argument to the method handler.
     /// Sometimes params can be omitted.
     pub params: Option<Value>,
+}
+
+impl BrpRequest {
+    /// Creates a request for `method` with reflected `params`.
+    pub fn new<T: PartialReflect + GetTypeRegistration>(
+        method: impl Into<String>,
+        id: impl Into<Value>,
+        params: &T,
+    ) -> Result<Self, serde_json::Error> {
+        Ok(Self {
+            method: method.into(),
+            id: Some(id.into()),
+            params: Some(builtin_methods::serialize_params(params)?),
+        })
+    }
 }
 
 // BRP uses json-rpc 2.0, so we need to include `"jsonrpc":"2.0"` in the json output
@@ -1589,8 +1807,120 @@ fn cache_schedule_build_metadata(
 
 #[cfg(test)]
 mod tests {
-    use crate::BrpRequest;
-    use serde_json::json;
+    use crate::{
+        builtin_methods, schemas::open_rpc::MethodObject, BrpRequest, BrpResult, RemoteMethod,
+        RemoteMethodSystemId, RemoteMethods, RemotePlugin,
+    };
+    use bevy_app::App;
+    use bevy_ecs::{reflect::AppTypeRegistry, system::In, world::World};
+    use bevy_reflect::Reflect;
+    use serde_json::{json, Value};
+
+    #[derive(Reflect)]
+    struct EchoParams {
+        name: String,
+        #[reflect(default)]
+        count: u32,
+        tag: Option<String>,
+    }
+
+    /// The echoed params.
+    #[derive(Reflect)]
+    struct EchoResponse {
+        name: String,
+        count: u32,
+    }
+
+    fn echo(In(params): In<EchoParams>) -> BrpResult<EchoResponse> {
+        Ok(EchoResponse {
+            name: params.name,
+            count: params.count,
+        })
+    }
+
+    fn run(world: &mut World, method: impl Into<RemoteMethod>, params: Option<Value>) -> BrpResult {
+        let RemoteMethodSystemId::Instant(id) = method.into().system else {
+            panic!("expected an instant method");
+        };
+        world.run_system_with(id, params).unwrap()
+    }
+
+    #[test]
+    fn discover_describes_methods() {
+        let mut app = App::new();
+        app.add_plugins(RemotePlugin::default().with_method_main("custom.echo", echo));
+
+        let methods = app.world().resource::<RemoteMethods>();
+        let registry = app.world().resource::<AppTypeRegistry>().read();
+        let document = MethodObject::for_methods(methods, &registry);
+        let find = |name: &str| document.iter().find(|m| m.name == name).unwrap();
+
+        let get = find(builtin_methods::BRP_GET_COMPONENTS_METHOD);
+        assert!(get.params.iter().any(|p| p.name == "entity" && p.required));
+
+        let echo = find("custom.echo");
+        let params: Vec<_> = echo
+            .params
+            .iter()
+            .map(|param| (param.name.as_str(), param.required))
+            .collect();
+        assert_eq!(params, [("name", true), ("count", false), ("tag", false)]);
+        let result = echo.result.as_ref().unwrap();
+        assert_eq!(result.description.as_deref(), Some("The echoed params."));
+    }
+
+    #[test]
+    fn reflected_params_are_parsed() {
+        let mut world = World::new();
+        let method = RemoteMethod::instant(&mut world, echo);
+
+        assert_eq!(
+            run(&mut world, method, Some(json!({ "name": "a", "count": 2 }))),
+            Ok(json!({ "name": "a", "count": 2 }))
+        );
+        assert_eq!(
+            run(&mut world, method, Some(json!({ "name": "a" }))),
+            Ok(json!({ "name": "a", "count": 0 }))
+        );
+        let err = run(&mut world, method, None).unwrap_err();
+        assert_eq!(err.code, crate::error_codes::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn builtin_params_keep_the_serde_format() {
+        use crate::builtin_methods::{BrpQueryParams, ComponentSelector};
+
+        let mut world = World::new();
+        let method = RemoteMethod::instant(&mut world, |In(params): In<BrpQueryParams>| {
+            Ok(json!(params.data.option == ComponentSelector::All))
+        });
+        assert_eq!(
+            run(
+                &mut world,
+                method,
+                Some(json!({ "data": { "option": "all" }, "unknown": 1 }))
+            ),
+            Ok(json!(true))
+        );
+    }
+
+    #[test]
+    fn raw_json_handlers_still_work() {
+        fn raw(In(params): In<Option<Value>>) -> BrpResult {
+            Ok(params.unwrap_or_default())
+        }
+
+        let mut world = World::new();
+        let id = world.register_system(raw);
+        assert_eq!(
+            run(
+                &mut world,
+                RemoteMethodSystemId::Instant(id),
+                Some(json!(1))
+            ),
+            Ok(json!(1))
+        );
+    }
 
     #[test]
     fn deserialize_brp_request_params_optional() {

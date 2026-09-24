@@ -22,9 +22,14 @@ use bevy_ecs::{
 use bevy_log::warn_once;
 use bevy_platform::collections::HashMap;
 use bevy_reflect::{
-    serde::{ReflectSerializer, TypedReflectDeserializer},
+    enums::VariantInfo,
+    serde::{ReflectSerializer, TypedReflectDeserializer, TypedReflectSerializer},
     structs::DynamicStruct,
-    GetPath, PartialReflect, Reflect, TypeRegistration, TypeRegistry,
+    tuple::DynamicTuple,
+    tuple_struct::DynamicTupleStruct,
+    FromReflect, GetPath, GetTypeRegistration, NamedField, PartialReflect, Reflect,
+    ReflectDeserialize, ReflectRef, ReflectSerialize, TypeInfo, TypeRegistration, TypeRegistry,
+    Typed, UnnamedField,
 };
 use serde::{de::DeserializeSeed as _, de::IntoDeserializer, Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -33,9 +38,10 @@ use crate::{
     error_codes,
     schemas::{
         json_schema::{export_type, JsonSchemaBevyType},
-        open_rpc::OpenRpcDocument,
+        open_rpc::{MethodObject, OpenRpcDocument},
+        params::{newtype_field, option_inner},
     },
-    BrpError, BrpResult, PreviousScheduleBuildMetadata,
+    BrpError, BrpResult, Json, PreviousScheduleBuildMetadata,
 };
 
 #[cfg(all(feature = "http", not(target_family = "wasm")))]
@@ -114,7 +120,8 @@ pub const RPC_DISCOVER_METHOD: &str = "rpc.discover";
 /// ID.
 ///
 /// The server responds with a [`BrpGetComponentsResponse`].
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Reflect)]
+#[reflect(Serialize, Deserialize)]
 pub struct BrpGetComponentsParams {
     /// The ID of the entity from which components are to be requested.
     pub entity: Entity,
@@ -131,12 +138,14 @@ pub struct BrpGetComponentsParams {
 
     /// An optional flag to fail when encountering an invalid component rather
     /// than skipping it. Defaults to false.
+    #[reflect(default)]
     #[serde(default)]
     pub strict: bool,
 }
 
 /// `world.get_resources`: Retrieves the value of a given resource.
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Reflect)]
+#[reflect(Serialize, Deserialize)]
 pub struct BrpGetResourcesParams {
     /// The [full path] of the resource type being requested.
     ///
@@ -148,18 +157,23 @@ pub struct BrpGetResourcesParams {
 /// and component values that match.
 ///
 /// The server responds with a [`BrpQueryResponse`].
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default, Reflect)]
+#[reflect(Serialize, Deserialize)]
 pub struct BrpQueryParams {
     /// The components to select.
+    #[reflect(default)]
+    #[serde(default)]
     pub data: BrpQuery,
 
     /// An optional filter that specifies which entities to include or
     /// exclude from the results.
+    #[reflect(default)]
     #[serde(default)]
     pub filter: BrpQueryFilter,
 
     /// An optional flag to fail when encountering an invalid component rather
     /// than skipping it. Defaults to false.
+    #[reflect(default)]
     #[serde(default)]
     pub strict: bool,
 }
@@ -168,7 +182,8 @@ pub struct BrpQueryParams {
 /// with its ID.
 ///
 /// The server responds with a [`BrpSpawnEntityResponse`].
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Reflect)]
+#[reflect(Serialize, Deserialize)]
 pub struct BrpSpawnEntityParams {
     /// A map from each component's full path to its serialized value.
     ///
@@ -179,13 +194,14 @@ pub struct BrpSpawnEntityParams {
     /// `Transform`.
     ///
     /// [full type paths]: bevy_reflect::TypePath::type_path
-    pub components: HashMap<String, Value>,
+    pub components: HashMap<String, Json>,
 }
 
 /// `world.despawn_entity`: Given an ID, despawns the entity with that ID.
 ///
 /// The server responds with an okay.
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Reflect)]
+#[reflect(Serialize, Deserialize)]
 pub struct BrpDespawnEntityParams {
     /// The ID of the entity to despawn.
     pub entity: Entity,
@@ -194,7 +210,8 @@ pub struct BrpDespawnEntityParams {
 /// `world.remove_components`: Deletes one or more components from an entity.
 ///
 /// The server responds with a null.
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Reflect)]
+#[reflect(Serialize, Deserialize)]
 pub struct BrpRemoveComponentsParams {
     /// The ID of the entity from which components are to be removed.
     pub entity: Entity,
@@ -211,7 +228,8 @@ pub struct BrpRemoveComponentsParams {
 }
 
 /// `world.remove_resources`: Removes the given resource from the world.
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Reflect)]
+#[reflect(Serialize, Deserialize)]
 pub struct BrpRemoveResourcesParams {
     /// The [full path] of the resource type to remove.
     ///
@@ -222,7 +240,8 @@ pub struct BrpRemoveResourcesParams {
 /// `world.insert_components`: Adds one or more components to an entity.
 ///
 /// The server responds with a null.
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Reflect)]
+#[reflect(Serialize, Deserialize)]
 pub struct BrpInsertComponentsParams {
     /// The ID of the entity that components are to be added to.
     pub entity: Entity,
@@ -236,12 +255,13 @@ pub struct BrpInsertComponentsParams {
     /// `Transform`.
     ///
     /// [full type paths]: bevy_reflect::TypePath::type_path
-    pub components: HashMap<String, Value>,
+    pub components: HashMap<String, Json>,
 }
 
 /// `world.insert_resources`: Inserts a resource into the world with a given
 /// value.
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Reflect)]
+#[reflect(Serialize, Deserialize)]
 pub struct BrpInsertResourcesParams {
     /// The [full path] of the resource type to insert.
     ///
@@ -249,13 +269,14 @@ pub struct BrpInsertResourcesParams {
     pub resource: String,
 
     /// The serialized value of the resource to be inserted.
-    pub value: Value,
+    pub value: Json,
 }
 
 /// `world.reparent_entities`: Assign a new parent to one or more entities.
 ///
 /// The server responds with a null.
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Reflect)]
+#[reflect(Serialize, Deserialize)]
 pub struct BrpReparentEntitiesParams {
     /// The IDs of the entities that are to become the new children of the
     /// `parent`.
@@ -265,24 +286,35 @@ pub struct BrpReparentEntitiesParams {
     /// `entities`.
     ///
     /// If this is `None`, then the entities are removed from all parents.
-    #[serde(default)]
     pub parent: Option<Entity>,
 }
 
 /// `world.list_components`: Returns a list of all type names of registered components in the
-/// system (no params provided), or those on an entity (params provided).
+/// system, or those on an entity.
 ///
 /// The server responds with a [`BrpListComponentsResponse`]
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq, Reflect)]
+#[reflect(Serialize, Deserialize)]
 pub struct BrpListComponentsParams {
-    /// The entity to query.
+    /// The entity to query, or all registered components if the entity is not provided.
+    pub entity: Option<Entity>,
+}
+
+/// `world.list_components+watch`: Watch an entity. Reports whenever a component is added or removed.
+///
+/// The server responds with a [`BrpListComponentsWatchingResponse`]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Reflect)]
+#[reflect(Serialize, Deserialize)]
+pub struct BrpListComponentsWatchingParams {
+    /// The entity to watch.
     pub entity: Entity,
 }
 
 /// `world.mutate_components`:
 ///
 /// The server responds with a null.
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Reflect)]
+#[reflect(Serialize, Deserialize)]
 pub struct BrpMutateComponentsParams {
     /// The entity of the component to mutate.
     pub entity: Entity,
@@ -298,13 +330,14 @@ pub struct BrpMutateComponentsParams {
     pub path: String,
 
     /// The value to insert at `path`.
-    pub value: Value,
+    pub value: Json,
 }
 
 /// `world.mutate_resources`:
 ///
 /// The server responds with a null.
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Reflect)]
+#[reflect(Serialize, Deserialize)]
 pub struct BrpMutateResourcesParams {
     /// The [full path] of the resource to mutate.
     ///
@@ -317,33 +350,39 @@ pub struct BrpMutateResourcesParams {
     pub path: String,
 
     /// The value to insert at `path`.
-    pub value: Value,
+    pub value: Json,
 }
 
 /// `world.trigger_event`:
 ///
 /// The server responds with a null.
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Reflect)]
+#[reflect(Serialize, Deserialize)]
 pub struct BrpTriggerEventParams {
     /// The [full path] of the event to trigger.
     ///
     /// [full path]: bevy_reflect::TypePath::type_path
     pub event: String,
     /// The serialized value of the event to be triggered, if any.
-    pub value: Option<Value>,
+    #[reflect(default)]
+    #[serde(default)]
+    pub value: Option<Json>,
 }
 
 /// `world.write_message`:
 ///
 /// The server responds with a null.
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Reflect)]
+#[reflect(Serialize, Deserialize)]
 pub struct BrpWriteMessageParams {
     /// The [full path] of the message to write.
     ///
     /// [full path]: bevy_reflect::TypePath::type_path
     pub message: String,
     /// The serialized value of the message to be written, if any.
-    pub value: Option<Value>,
+    #[reflect(default)]
+    #[serde(default)]
+    pub value: Option<Json>,
 }
 
 /// `world.observe+watch`: Registers an observer for the given event type and
@@ -353,7 +392,8 @@ pub struct BrpWriteMessageParams {
 /// Otherwise, observes all global triggers of the event.
 ///
 /// The server responds with serialized event data when events are observed.
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Reflect)]
+#[reflect(Serialize, Deserialize)]
 pub struct BrpObserveParams {
     /// The [full path] of the event type to observe.
     ///
@@ -362,16 +402,37 @@ pub struct BrpObserveParams {
 
     /// An optional entity to scope the observer to.
     /// When set, only events targeting this entity will be observed.
-    #[serde(default)]
     pub entity: Option<Entity>,
 }
+
+/// `world.list_resources`: Lists all registered resources.
+///
+/// The server responds with a [`BrpListResourcesResponse`].
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize, Reflect)]
+#[reflect(Serialize, Deserialize)]
+pub struct BrpListResourcesParams;
+
+/// `rpc.discover`: Lists all available methods and their parameters.
+///
+/// The server responds with an [`OpenRpcDocument`].
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize, Reflect)]
+#[reflect(Serialize, Deserialize)]
+pub struct BrpDiscoverParams;
+
+/// `schedule.list`: Lists all schedules in the world.
+///
+/// The server responds with a [`BrpScheduleListResponse`].
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize, Reflect)]
+#[reflect(Serialize, Deserialize)]
+pub struct BrpScheduleListParams;
 
 /// `schedule.graph`:
 ///
 /// The server responds with [`BrpScheduleGraphResponse`] if the schedule is found,
 /// or a `resource_error` if not found.
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
-struct BrpScheduleGraphParams {
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Reflect)]
+#[reflect(Serialize, Deserialize)]
+pub struct BrpScheduleGraphParams {
     /// The schedule to describe.
     ///
     /// A list of describable schedules can be fetched from the `schedule.list` endpoint.
@@ -379,12 +440,13 @@ struct BrpScheduleGraphParams {
 }
 
 /// Describes the data that is to be fetched in a query.
-#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Reflect)]
 pub struct BrpQuery {
     /// The [full path] of the type name of each component that is to be
     /// fetched.
     ///
     /// [full path]: bevy_reflect::TypePath::type_path
+    #[reflect(default)]
     #[serde(default)]
     pub components: Vec<String>,
 
@@ -392,6 +454,7 @@ pub struct BrpQuery {
     /// optionally fetched.
     ///
     /// [full path]: bevy_reflect::TypePath::type_path
+    #[reflect(default)]
     #[serde(default)]
     pub option: ComponentSelector,
 
@@ -399,18 +462,20 @@ pub struct BrpQuery {
     /// for presence.
     ///
     /// [full path]: bevy_reflect::TypePath::type_path
+    #[reflect(default)]
     #[serde(default)]
     pub has: Vec<String>,
 }
 
 /// Additional constraints that can be placed on a query to include or exclude
 /// certain entities.
-#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Reflect)]
 pub struct BrpQueryFilter {
     /// The [full path] of the type name of each component that must not be
     /// present on the entity for it to be included in the results.
     ///
     /// [full path]: bevy_reflect::TypePath::type_path
+    #[reflect(default)]
     #[serde(default)]
     pub without: Vec<String>,
 
@@ -418,39 +483,47 @@ pub struct BrpQueryFilter {
     /// on the entity for it to be included in the results.
     ///
     /// [full path]: bevy_reflect::TypePath::type_path
+    #[reflect(default)]
     #[serde(default)]
     pub with: Vec<String>,
 }
 
-/// Constraints that can be placed on a query to include or exclude
-/// certain definitions.
-#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
+/// `registry.schema`: Exports the JSON Schemas of registered types, optionally filtered by crate or trait.
+///
+/// The server responds with a [`JsonSchemaBevyType`].
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Reflect)]
+#[reflect(Serialize, Deserialize)]
 pub struct BrpJsonSchemaQueryFilter {
     /// The crate name of the type name of each component that must not be
     /// present on the entity for it to be included in the results.
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    #[reflect(default)]
+    #[serde(default)]
     pub without_crates: Vec<String>,
 
     /// The crate name of the type name of each component that must be present
     /// on the entity for it to be included in the results.
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    #[reflect(default)]
+    #[serde(default)]
     pub with_crates: Vec<String>,
 
     /// Constrain resource by type
+    #[reflect(default)]
     #[serde(default)]
     pub type_limit: JsonSchemaTypeLimit,
 }
 
 /// Additional [`BrpJsonSchemaQueryFilter`] constraints that can be placed on a query to include or exclude
 /// certain definitions.
-#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Reflect)]
 pub struct JsonSchemaTypeLimit {
     /// Schema cannot have specified reflect types
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    #[reflect(default)]
+    #[serde(default)]
     pub without: Vec<String>,
 
     /// Schema needs to have specified reflect types
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    #[reflect(default)]
+    #[serde(default)]
     pub with: Vec<String>,
 }
 
@@ -594,17 +667,187 @@ pub fn parse_some<T: for<'de> Deserialize<'de>>(value: Option<Value>) -> Result<
     }
 }
 
+/// Parses the `params` of a request into `T`, which must be registered in `registry`.
+pub fn parse_params<T: FromReflect + Typed>(
+    value: Option<Value>,
+    registry: &TypeRegistry,
+) -> Result<T, BrpError> {
+    let info = T::type_info();
+    if crate::schemas::params::takes_no_params(info) {
+        let empty: Box<dyn PartialReflect> = match info {
+            TypeInfo::Tuple(_) => Box::new(DynamicTuple::default()),
+            TypeInfo::TupleStruct(_) => Box::new(DynamicTupleStruct::default()),
+            _ => Box::new(DynamicStruct::default()),
+        };
+        return T::from_reflect(&*empty)
+            .ok_or_else(|| BrpError::internal(format!("cannot construct `{}`", info.type_path())));
+    }
+    let mut value = value.unwrap_or_else(|| Value::Object(Map::new()));
+    fill_absent_options(info, &mut value, registry);
+    let registration = registry.get(info.type_id()).ok_or_else(|| {
+        BrpError::internal(format!(
+            "parameter type `{}` is not registered",
+            info.type_path()
+        ))
+    })?;
+    let dynamic = TypedReflectDeserializer::new(registration, registry)
+        .deserialize(value)
+        .map_err(|err| BrpError {
+            code: error_codes::INVALID_PARAMS,
+            message: err.to_string(),
+            data: None,
+        })?;
+    T::from_reflect(&*dynamic).ok_or_else(|| {
+        let missing = match (info, dynamic.reflect_ref()) {
+            (TypeInfo::Struct(info), ReflectRef::Struct(given)) => info
+                .iter()
+                .filter(|field| {
+                    !field.has_default()
+                        && !field
+                            .type_info()
+                            .is_some_and(|info| option_inner(info).is_some())
+                        && given.field(field.name()).is_none()
+                })
+                .map(NamedField::name)
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        };
+        BrpError {
+            code: error_codes::INVALID_PARAMS,
+            message: if missing.is_empty() {
+                format!("params do not form a `{}`", info.type_path())
+            } else {
+                format!("missing field(s) {missing:?}")
+            },
+            data: None,
+        }
+    })
+}
+
+/// Serializes method params into JSON.
+pub fn serialize_params<T: PartialReflect + GetTypeRegistration>(
+    params: &T,
+) -> Result<Value, serde_json::Error> {
+    let mut registry = TypeRegistry::new();
+    registry.register::<T>();
+    serde_json::to_value(TypedReflectSerializer::new(params, &registry))
+}
+
+/// Fills in missing `Option` fields with `null` so reflection reads them as `None`.
+fn fill_absent_options(info: &'static TypeInfo, value: &mut Value, registry: &TypeRegistry) {
+    if registry
+        .get(info.type_id())
+        .is_some_and(|registration| registration.data::<ReflectDeserialize>().is_some())
+    {
+        return;
+    }
+    if let Some(field_info) = newtype_field(info, registry).and_then(UnnamedField::type_info) {
+        fill_absent_options(field_info, value, registry);
+        return;
+    }
+    match (info, value) {
+        (TypeInfo::Struct(struct_info), Value::Object(object)) => {
+            fill_absent_named_fields(struct_info.iter(), object, registry);
+        }
+        (TypeInfo::TupleStruct(tuple_info), Value::Array(items)) => {
+            fill_absent_unnamed_fields(tuple_info.iter(), items, registry);
+        }
+        (TypeInfo::Tuple(tuple_info), Value::Array(items)) => {
+            fill_absent_unnamed_fields(tuple_info.iter(), items, registry);
+        }
+        (TypeInfo::List(list_info), Value::Array(items)) => {
+            if let Some(item_info) = list_info.item_info() {
+                for item in items {
+                    fill_absent_options(item_info, item, registry);
+                }
+            }
+        }
+        (TypeInfo::Array(array_info), Value::Array(items)) => {
+            if let Some(item_info) = array_info.item_info() {
+                for item in items {
+                    fill_absent_options(item_info, item, registry);
+                }
+            }
+        }
+        (TypeInfo::Map(map_info), Value::Object(object)) => {
+            if let Some(value_info) = map_info.value_info() {
+                for value in object.values_mut() {
+                    fill_absent_options(value_info, value, registry);
+                }
+            }
+        }
+        (TypeInfo::Enum(enum_info), value) => {
+            if let Some(inner) = option_inner(info) {
+                if !value.is_null() {
+                    fill_absent_options(inner, value, registry);
+                }
+            } else if let Value::Object(object) = value {
+                for (variant, payload) in object.iter_mut() {
+                    match (enum_info.variant(variant), payload) {
+                        (Some(VariantInfo::Struct(variant)), Value::Object(object)) => {
+                            fill_absent_named_fields(variant.iter(), object, registry);
+                        }
+                        (Some(VariantInfo::Tuple(variant)), payload)
+                            if variant.field_len() == 1 =>
+                        {
+                            if let Some(field_info) =
+                                variant.field_at(0).and_then(UnnamedField::type_info)
+                            {
+                                fill_absent_options(field_info, payload, registry);
+                            }
+                        }
+                        (Some(VariantInfo::Tuple(variant)), Value::Array(items)) => {
+                            fill_absent_unnamed_fields(variant.iter(), items, registry);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn fill_absent_named_fields<'a>(
+    fields: impl Iterator<Item = &'a NamedField>,
+    object: &mut Map<String, Value>,
+    registry: &TypeRegistry,
+) {
+    for field in fields {
+        let Some(field_info) = field.type_info() else {
+            continue;
+        };
+        match object.get_mut(field.name()) {
+            Some(value) => fill_absent_options(field_info, value, registry),
+            None if option_inner(field_info).is_some() && !field.has_default() => {
+                object.insert(field.name().to_owned(), Value::Null);
+            }
+            None => {}
+        }
+    }
+}
+
+fn fill_absent_unnamed_fields<'a>(
+    fields: impl Iterator<Item = &'a UnnamedField>,
+    items: &mut [Value],
+    registry: &TypeRegistry,
+) {
+    for (field, item) in fields.zip(items) {
+        if let Some(field_info) = field.type_info() {
+            fill_absent_options(field_info, item, registry);
+        }
+    }
+}
+
 /// Handles a `world.get_components` request coming from a client.
 pub fn process_remote_get_components_request(
-    In(params): In<Option<Value>>,
-    world: &World,
-) -> BrpResult {
-    let BrpGetComponentsParams {
+    In(BrpGetComponentsParams {
         entity,
         components,
         strict,
-    } = parse_some(params)?;
-
+    }): In<BrpGetComponentsParams>,
+    world: &World,
+) -> BrpResult {
     let app_type_registry = world.resource::<AppTypeRegistry>();
     let type_registry = app_type_registry.read();
     let entity_ref = get_entity(world, entity)?;
@@ -616,13 +859,11 @@ pub fn process_remote_get_components_request(
 
 /// Handles a `world.get_resources` request coming from a client.
 pub fn process_remote_get_resources_request(
-    In(params): In<Option<Value>>,
+    In(BrpGetResourcesParams {
+        resource: resource_path,
+    }): In<BrpGetResourcesParams>,
     world: &World,
 ) -> BrpResult {
-    let BrpGetResourcesParams {
-        resource: resource_path,
-    } = parse_some(params)?;
-
     let app_type_registry = world.resource::<AppTypeRegistry>();
     let type_registry = app_type_registry.read();
     get_reflect_resource(&type_registry, &resource_path).map_err(BrpError::resource_error)?;
@@ -660,16 +901,14 @@ pub fn process_remote_get_resources_request(
 
 /// Handles a `world.get_components+watch` request coming from a client.
 pub fn process_remote_get_components_watching_request(
-    In(params): In<Option<Value>>,
-    world: &World,
-    mut removal_cursors: Local<HashMap<ComponentId, MessageCursor<RemovedComponentEntity>>>,
-) -> BrpResult<Option<Value>> {
-    let BrpGetComponentsParams {
+    In(BrpGetComponentsParams {
         entity,
         components,
         strict,
-    } = parse_some(params)?;
-
+    }): In<BrpGetComponentsParams>,
+    world: &World,
+    mut removal_cursors: Local<HashMap<ComponentId, MessageCursor<RemovedComponentEntity>>>,
+) -> BrpResult<Option<Value>> {
     let app_type_registry = world.resource::<AppTypeRegistry>();
     let type_registry = app_type_registry.read();
     let entity_ref = get_entity(world, entity)?;
@@ -837,7 +1076,8 @@ fn reflect_component(
 /// `bevy_transform::components::transform::Transform`, not just
 /// `Transform`.
 ///
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Reflect)]
+#[reflect(Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ComponentSelector {
     /// An "all" selector that indicates all components should be selected.
@@ -854,8 +1094,8 @@ impl Default for ComponentSelector {
 }
 
 /// Handles a `world.query` request coming from a client.
-pub fn process_remote_query_request(In(params): In<Option<Value>>, world: &mut World) -> BrpResult {
-    let BrpQueryParams {
+pub fn process_remote_query_request(
+    In(BrpQueryParams {
         data: BrpQuery {
             components,
             option,
@@ -863,19 +1103,9 @@ pub fn process_remote_query_request(In(params): In<Option<Value>>, world: &mut W
         },
         filter,
         strict,
-    } = match params {
-        Some(params) => parse_some(Some(params))?,
-        None => BrpQueryParams {
-            data: BrpQuery {
-                components: Vec::new(),
-                option: ComponentSelector::default(),
-                has: Vec::new(),
-            },
-            filter: BrpQueryFilter::default(),
-            strict: false,
-        },
-    };
-
+    }): In<BrpQueryParams>,
+    world: &mut World,
+) -> BrpResult {
     let app_type_registry = world.resource::<AppTypeRegistry>().clone();
     let type_registry = app_type_registry.read();
 
@@ -1056,11 +1286,9 @@ fn serialize_components(
 
 /// Handles a `world.spawn_entity` request coming from a client.
 pub fn process_remote_spawn_entity_request(
-    In(params): In<Option<Value>>,
+    In(BrpSpawnEntityParams { components }): In<BrpSpawnEntityParams>,
     world: &mut World,
 ) -> BrpResult {
-    let BrpSpawnEntityParams { components } = parse_some(params)?;
-
     let app_type_registry = world.resource::<AppTypeRegistry>().clone();
     let type_registry = app_type_registry.read();
 
@@ -1077,10 +1305,11 @@ pub fn process_remote_spawn_entity_request(
 
 /// Handles a `rpc.discover` request coming from a client.
 pub fn process_remote_list_methods_request(
-    In(_params): In<Option<Value>>,
+    In(_): In<BrpDiscoverParams>,
     world: &mut World,
 ) -> BrpResult {
     let remote_methods = world.resource::<crate::RemoteMethods>();
+    let type_registry = world.resource::<AppTypeRegistry>().read();
 
     #[cfg(all(feature = "http", not(target_family = "wasm")))]
     let servers = match (
@@ -1105,7 +1334,7 @@ pub fn process_remote_list_methods_request(
 
     let doc = OpenRpcDocument {
         info: Default::default(),
-        methods: remote_methods.into(),
+        methods: MethodObject::for_methods(remote_methods, &type_registry),
         openrpc: "1.3.2".to_owned(),
         servers,
     };
@@ -1115,11 +1344,9 @@ pub fn process_remote_list_methods_request(
 
 /// Handles a `world.insert_components` request (insert components) coming from a client.
 pub fn process_remote_insert_components_request(
-    In(params): In<Option<Value>>,
+    In(BrpInsertComponentsParams { entity, components }): In<BrpInsertComponentsParams>,
     world: &mut World,
 ) -> BrpResult {
-    let BrpInsertComponentsParams { entity, components } = parse_some(params)?;
-
     let app_type_registry = world.resource::<AppTypeRegistry>().clone();
     let type_registry = app_type_registry.read();
 
@@ -1134,14 +1361,12 @@ pub fn process_remote_insert_components_request(
 
 /// Handles a `world.insert_resources` request coming from a client.
 pub fn process_remote_insert_resources_request(
-    In(params): In<Option<Value>>,
-    world: &mut World,
-) -> BrpResult {
-    let BrpInsertResourcesParams {
+    In(BrpInsertResourcesParams {
         resource: resource_path,
         value,
-    } = parse_some(params)?;
-
+    }): In<BrpInsertResourcesParams>,
+    world: &mut World,
+) -> BrpResult {
     let app_type_registry = world.resource::<AppTypeRegistry>().clone();
     let type_registry = app_type_registry.read();
 
@@ -1166,15 +1391,14 @@ pub fn process_remote_insert_resources_request(
 /// This method allows you to mutate a single field inside an Entity's
 /// component.
 pub fn process_remote_mutate_components_request(
-    In(params): In<Option<Value>>,
-    world: &mut World,
-) -> BrpResult {
-    let BrpMutateComponentsParams {
+    In(BrpMutateComponentsParams {
         entity,
         component,
         path,
         value,
-    } = parse_some(params)?;
+    }): In<BrpMutateComponentsParams>,
+    world: &mut World,
+) -> BrpResult {
     let app_type_registry = world.resource::<AppTypeRegistry>().clone();
     let type_registry = app_type_registry.read();
 
@@ -1212,7 +1436,7 @@ pub fn process_remote_mutate_components_request(
     // Get the reflected representation of the value to be inserted
     // into the component.
     let value: Box<dyn PartialReflect> = TypedReflectDeserializer::new(value_type, &type_registry)
-        .deserialize(&value)
+        .deserialize(&value.0)
         .map_err(BrpError::component_error)?;
 
     // Apply the mutation.
@@ -1227,15 +1451,13 @@ pub fn process_remote_mutate_components_request(
 
 /// Handles a `world.mutate_resources` request coming from a client.
 pub fn process_remote_mutate_resources_request(
-    In(params): In<Option<Value>>,
-    world: &mut World,
-) -> BrpResult {
-    let BrpMutateResourcesParams {
+    In(BrpMutateResourcesParams {
         resource: resource_path,
         path: field_path,
         value,
-    } = parse_some(params)?;
-
+    }): In<BrpMutateResourcesParams>,
+    world: &mut World,
+) -> BrpResult {
     let app_type_registry = world.resource::<AppTypeRegistry>().clone();
     let type_registry = app_type_registry.read();
 
@@ -1267,7 +1489,7 @@ pub fn process_remote_mutate_resources_request(
     // Use the field's type registration to deserialize the given value.
     let deserialized_value: Box<dyn PartialReflect> =
         TypedReflectDeserializer::new(value_registration, &type_registry)
-            .deserialize(&value)
+            .deserialize(&value.0)
             .map_err(BrpError::resource_error)?;
 
     // Apply the value to the resource.
@@ -1282,11 +1504,9 @@ pub fn process_remote_mutate_resources_request(
 
 /// Handles a `world.remove_components` request (remove components) coming from a client.
 pub fn process_remote_remove_components_request(
-    In(params): In<Option<Value>>,
+    In(BrpRemoveComponentsParams { entity, components }): In<BrpRemoveComponentsParams>,
     world: &mut World,
 ) -> BrpResult {
-    let BrpRemoveComponentsParams { entity, components } = parse_some(params)?;
-
     let app_type_registry = world.resource::<AppTypeRegistry>().clone();
     let type_registry = app_type_registry.read();
 
@@ -1311,13 +1531,11 @@ pub fn process_remote_remove_components_request(
 
 /// Handles a `world.remove_resources` request coming from a client.
 pub fn process_remote_remove_resources_request(
-    In(params): In<Option<Value>>,
+    In(BrpRemoveResourcesParams {
+        resource: resource_path,
+    }): In<BrpRemoveResourcesParams>,
     world: &mut World,
 ) -> BrpResult {
-    let BrpRemoveResourcesParams {
-        resource: resource_path,
-    } = parse_some(params)?;
-
     let app_type_registry = world.resource::<AppTypeRegistry>().clone();
     let type_registry = app_type_registry.read();
 
@@ -1333,11 +1551,9 @@ pub fn process_remote_remove_resources_request(
 
 /// Handles a `world.despawn_entity` (despawn entity) request coming from a client.
 pub fn process_remote_despawn_entity_request(
-    In(params): In<Option<Value>>,
+    In(BrpDespawnEntityParams { entity }): In<BrpDespawnEntityParams>,
     world: &mut World,
 ) -> BrpResult {
-    let BrpDespawnEntityParams { entity } = parse_some(params)?;
-
     get_entity_mut(world, entity)?.despawn();
 
     Ok(Value::Null)
@@ -1345,14 +1561,12 @@ pub fn process_remote_despawn_entity_request(
 
 /// Handles a `world.reparent_entities` request coming from a client.
 pub fn process_remote_reparent_entities_request(
-    In(params): In<Option<Value>>,
-    world: &mut World,
-) -> BrpResult {
-    let BrpReparentEntitiesParams {
+    In(BrpReparentEntitiesParams {
         entities,
         parent: maybe_parent,
-    } = parse_some(params)?;
-
+    }): In<BrpReparentEntitiesParams>,
+    world: &mut World,
+) -> BrpResult {
     // If `Some`, reparent the entities.
     if let Some(parent) = maybe_parent {
         let mut parent_commands =
@@ -1376,7 +1590,7 @@ pub fn process_remote_reparent_entities_request(
 
 /// Handles a `world.list_components` request (list all components) coming from a client.
 pub fn process_remote_list_components_request(
-    In(params): In<Option<Value>>,
+    In(BrpListComponentsParams { entity }): In<BrpListComponentsParams>,
     world: &World,
 ) -> BrpResult {
     let app_type_registry = world.resource::<AppTypeRegistry>();
@@ -1385,7 +1599,7 @@ pub fn process_remote_list_components_request(
     let mut response = BrpListComponentsResponse::default();
 
     // If `Some`, return all components of the provided entity.
-    if let Some(BrpListComponentsParams { entity }) = params.map(parse).transpose()? {
+    if let Some(entity) = entity {
         let entity = get_entity(world, entity)?;
         for &component_id in entity.archetype().components().iter() {
             let Some(component_info) = world.components().get_info(component_id) else {
@@ -1412,7 +1626,7 @@ pub fn process_remote_list_components_request(
 
 /// Handles a `world.list_resources` request coming from a client.
 pub fn process_remote_list_resources_request(
-    In(_params): In<Option<Value>>,
+    In(_params): In<BrpListResourcesParams>,
     world: &World,
 ) -> BrpResult {
     let mut response = BrpListResourcesResponse::default();
@@ -1433,11 +1647,10 @@ pub fn process_remote_list_resources_request(
 
 /// Handles a `world.list_components+watch` request coming from a client.
 pub fn process_remote_list_components_watching_request(
-    In(params): In<Option<Value>>,
+    In(BrpListComponentsWatchingParams { entity }): In<BrpListComponentsWatchingParams>,
     world: &World,
     mut removal_cursors: Local<HashMap<ComponentId, MessageCursor<RemovedComponentEntity>>>,
 ) -> BrpResult<Option<Value>> {
-    let BrpListComponentsParams { entity } = parse_some(params)?;
     let entity_ref = get_entity(world, entity)?;
     let mut response = BrpListComponentsWatchingResponse::default();
 
@@ -1479,11 +1692,9 @@ pub fn process_remote_list_components_watching_request(
 
 /// Handles a `world.trigger_event` request coming from a client.
 pub fn process_remote_trigger_event_request(
-    In(params): In<Option<Value>>,
+    In(BrpTriggerEventParams { event, value }): In<BrpTriggerEventParams>,
     world: &mut World,
 ) -> BrpResult {
-    let BrpTriggerEventParams { event, value } = parse_some(params)?;
-
     world.resource_scope(|world, registry: Mut<AppTypeRegistry>| {
         let registry = registry.read();
 
@@ -1501,7 +1712,7 @@ pub fn process_remote_trigger_event_request(
         if let Some(payload) = value {
             let payload: Box<dyn PartialReflect> =
                 TypedReflectDeserializer::new(registration, &registry)
-                    .deserialize(payload.into_deserializer())
+                    .deserialize(payload.0.into_deserializer())
                     .map_err(|err| {
                         BrpError::resource_error(format!("{event} is invalid: {err}"))
                     })?;
@@ -1517,11 +1728,9 @@ pub fn process_remote_trigger_event_request(
 
 /// Handles a `world.write_message` request coming from a client.
 pub fn process_remote_write_message_request(
-    In(params): In<Option<Value>>,
+    In(BrpWriteMessageParams { message, value }): In<BrpWriteMessageParams>,
     world: &mut World,
 ) -> BrpResult {
-    let BrpWriteMessageParams { message, value } = parse_some(params)?;
-
     world.resource_scope(|world, registry: Mut<AppTypeRegistry>| {
         let registry = registry.read();
 
@@ -1539,7 +1748,7 @@ pub fn process_remote_write_message_request(
         if let Some(payload) = value {
             let payload: Box<dyn PartialReflect> =
                 TypedReflectDeserializer::new(registration, &registry)
-                    .deserialize(payload.into_deserializer())
+                    .deserialize(payload.0.into_deserializer())
                     .map_err(|err| {
                         BrpError::resource_error(format!("{message} is invalid: {err}"))
                     })?;
@@ -1568,11 +1777,9 @@ pub struct BrpEventObservers {
 ///
 /// When `entity` is provided, the observer is scoped to that entity. Otherwise a global observer is registered.
 pub fn process_remote_observe_watching_request(
-    In(params): In<Option<Value>>,
+    In(BrpObserveParams { event, entity }): In<BrpObserveParams>,
     world: &mut World,
 ) -> BrpResult<Option<Value>> {
-    let BrpObserveParams { event, entity } = parse_some(params)?;
-
     let key = match entity {
         Some(e) => format!("{event}@{e}"),
         None => event.clone(),
@@ -1665,12 +1872,7 @@ pub fn process_remote_observe_watching_request(
 }
 
 /// Handles a `registry.schema` request (list all registry types in form of schema) coming from a client.
-pub fn export_registry_types(In(params): In<Option<Value>>, world: &World) -> BrpResult {
-    let filter: BrpJsonSchemaQueryFilter = match params {
-        None => Default::default(),
-        Some(params) => parse(params)?,
-    };
-
+pub fn export_registry_types(In(filter): In<BrpJsonSchemaQueryFilter>, world: &World) -> BrpResult {
     let extra_info = world.resource::<crate::schemas::SchemaTypesMetadata>();
     let types = world.resource::<AppTypeRegistry>();
     let components = world.components();
@@ -1719,7 +1921,7 @@ pub fn export_registry_types(In(params): In<Option<Value>>, world: &World) -> Br
 }
 
 /// Handles a `schedule.list` request coming from a client.
-pub fn schedule_list(In(_params): In<Option<Value>>, world: &World) -> BrpResult {
+pub fn schedule_list(In(_params): In<BrpScheduleListParams>, world: &World) -> BrpResult {
     let schedules = world.resource::<Schedules>();
 
     let response = BrpScheduleListResponse {
@@ -1745,9 +1947,10 @@ pub fn schedule_list(In(_params): In<Option<Value>>, world: &World) -> BrpResult
 /// Handles a `schedule.graph` request coming from a client.
 ///
 /// Bevy removes a schedule from the world before running it, meaning that not all Schedules are available.
-pub fn schedule_graph(In(params): In<Option<Value>>, world: &mut World) -> BrpResult {
-    let BrpScheduleGraphParams { schedule_label } = parse_some(params)?;
-
+pub fn schedule_graph(
+    In(BrpScheduleGraphParams { schedule_label }): In<BrpScheduleGraphParams>,
+    world: &mut World,
+) -> BrpResult {
     let schedules = world.resource::<Schedules>();
 
     let Some((_, mut schedule)) = schedules
@@ -1907,7 +2110,7 @@ fn reflect_component_from_id(
 /// return the associated collection of deserialized reflected values.
 fn deserialize_components(
     type_registry: &TypeRegistry,
-    components: HashMap<String, Value>,
+    components: HashMap<String, Json>,
 ) -> AnyhowResult<Vec<Box<dyn PartialReflect>>> {
     let mut reflect_components = vec![];
 
@@ -1917,7 +2120,7 @@ fn deserialize_components(
         };
         let reflected: Box<dyn PartialReflect> =
             TypedReflectDeserializer::new(component_type, type_registry)
-                .deserialize(&component)
+                .deserialize(&component.0)
                 .map_err(|err| anyhow!("{component_path} is invalid: {err}"))?;
         reflect_components.push(reflected);
     }
@@ -1930,14 +2133,14 @@ fn deserialize_components(
 fn deserialize_resource(
     type_registry: &TypeRegistry,
     resource_path: &str,
-    value: Value,
+    value: Json,
 ) -> AnyhowResult<Box<dyn PartialReflect>> {
     let Some(resource_type) = type_registry.get_with_type_path(resource_path) else {
         return Err(anyhow!("Unknown resource type: `{}`", resource_path));
     };
     let reflected: Box<dyn PartialReflect> =
         TypedReflectDeserializer::new(resource_type, type_registry)
-            .deserialize(&value)
+            .deserialize(&value.0)
             .map_err(|err| anyhow!("{resource_path} is invalid: {err}"))?;
     Ok(reflected)
 }
@@ -2068,9 +2271,9 @@ mod tests {
             name: String,
             health: u32,
         }
-        let components: HashMap<String, Value> = [(
+        let components: HashMap<String, Json> = [(
             String::from("bevy_remote::builtin_methods::tests::Player"),
-            serde_json::json!({"name": "John", "health": 50}),
+            Json(serde_json::json!({"name": "John", "health": 50})),
         )]
         .into();
         let atr = AppTypeRegistry::default();
@@ -2107,13 +2310,12 @@ mod tests {
         world.insert_resource(TestResult(false));
         world.insert_resource(atr);
 
-        let params = serde_json::to_value(&BrpTriggerEventParams {
+        let params = BrpTriggerEventParams {
             event: "bevy_remote::builtin_methods::tests::Pass".to_owned(),
             value: None,
-        })
-        .expect("FAIL");
+        };
         assert_eq!(
-            process_remote_trigger_event_request(In(Some(params)), &mut world),
+            process_remote_trigger_event_request(In(params), &mut world),
             Ok(Null)
         );
         assert!(world.resource::<TestResult>().0);
@@ -2135,30 +2337,28 @@ mod tests {
         let mut world = World::new();
         world.insert_resource(atr);
 
-        let observe_params = serde_json::to_value(&BrpObserveParams {
+        let observe_params = BrpObserveParams {
             event: "bevy_remote::builtin_methods::tests::Ping".to_owned(),
             entity: None,
-        })
-        .expect("FAIL");
+        };
 
         assert_eq!(
-            process_remote_observe_watching_request(In(Some(observe_params.clone())), &mut world,),
+            process_remote_observe_watching_request(In(observe_params.clone()), &mut world),
             Ok(None)
         );
         assert!(world.contains_resource::<BrpEventObservers>());
 
-        let trigger_params = serde_json::to_value(&BrpTriggerEventParams {
+        let trigger_params = BrpTriggerEventParams {
             event: "bevy_remote::builtin_methods::tests::Ping".to_owned(),
-            value: Some(serde_json::json!({ "value": 42 })),
-        })
-        .expect("FAIL");
+            value: Some(Json(serde_json::json!({ "value": 42 }))),
+        };
         assert_eq!(
-            process_remote_trigger_event_request(In(Some(trigger_params)), &mut world),
+            process_remote_trigger_event_request(In(trigger_params), &mut world),
             Ok(Null)
         );
 
         let captured =
-            process_remote_observe_watching_request(In(Some(observe_params.clone())), &mut world)
+            process_remote_observe_watching_request(In(observe_params.clone()), &mut world)
                 .expect("poll should succeed")
                 .expect("events should be returned");
         let events: Vec<Value> =
@@ -2167,7 +2367,7 @@ mod tests {
         assert_eq!(events[0].get("value"), Some(&serde_json::json!(42)));
 
         assert_eq!(
-            process_remote_observe_watching_request(In(Some(observe_params)), &mut world),
+            process_remote_observe_watching_request(In(observe_params), &mut world),
             Ok(None)
         );
     }
@@ -2187,13 +2387,12 @@ mod tests {
         world.insert_resource(atr);
         world.init_resource::<Messages<Pass>>();
 
-        let params = serde_json::to_value(&BrpWriteMessageParams {
+        let params = BrpWriteMessageParams {
             message: "bevy_remote::builtin_methods::tests::Pass".to_owned(),
             value: None,
-        })
-        .expect("FAIL");
+        };
         assert_eq!(
-            process_remote_write_message_request(In(Some(params)), &mut world),
+            process_remote_write_message_request(In(params), &mut world),
             Ok(Null)
         );
         assert!(!world.get_resource::<Messages<Pass>>().unwrap().is_empty());
@@ -2228,11 +2427,8 @@ mod tests {
 
         let params = BrpJsonSchemaQueryFilter::default();
 
-        let params_value = In(Some(
-            serde_json::to_value(params).expect("Failed to serialize"),
-        ));
         let result_value =
-            export_registry_types(params_value, &world).expect("Failed to export registry types");
+            export_registry_types(In(params), &world).expect("Failed to export registry types");
 
         let result: HashMap<String, JsonSchemaBevyType> =
             parse(result_value).expect("Failed to parse exported registry types");
@@ -2283,7 +2479,7 @@ mod tests {
             ..Default::default()
         });
         test_serialize_deserialize(BrpListComponentsParams {
-            entity: Entity::from_raw_u32(0).unwrap(),
+            entity: Some(Entity::from_raw_u32(0).unwrap()),
         });
     }
 
@@ -2337,7 +2533,7 @@ mod tests {
         // Schedule3 is the "BRP schedule"
 
         fn f3(world: &World) {
-            let res = schedule_list(In(None), world);
+            let res = schedule_list(In(BrpScheduleListParams), world);
             let res2 = res.expect("expect to work");
             let res3 = serde_json::from_value::<BrpScheduleListResponse>(res2).unwrap();
 
@@ -2392,10 +2588,9 @@ mod tests {
         world.init_resource::<PreviousScheduleBuildMetadata>();
         world.add_observer(cache_schedule_build_metadata);
 
-        let params = serde_json::to_value(&BrpScheduleGraphParams {
+        let params = BrpScheduleGraphParams {
             schedule_label: "MySchedule".to_string(),
-        })
-        .expect("FAIL");
+        };
 
         // Each system creates a corresponding system set.
         // In the below notation we use f1 for the system, and F1 for the corresponding system set.
@@ -2405,7 +2600,7 @@ mod tests {
         // - 6 hierarchy edges: F1 -> f1, F2 -> f2, F3 -> f3, F4 -> f4, S1 -> f3, S2 -> f4
         // - 4 dependency edges: f1 -> f2, S1 -> f4, f1 -> apply_deferred, apply_deferred -> f2
 
-        let res = schedule_graph(In(Some(params)), &mut world);
+        let res = schedule_graph(In(params), &mut world);
         let res2 = res.expect("expect to work");
         let res3 = serde_json::from_value::<BrpScheduleGraphResponse>(res2).unwrap();
 
@@ -2447,12 +2642,11 @@ mod tests {
             .schedule_scope(MySchedule, |world, schedule| schedule.initialize(world))
             .unwrap();
 
-        let params = serde_json::to_value(&BrpScheduleGraphParams {
+        let params = BrpScheduleGraphParams {
             schedule_label: "MySchedule".to_string(),
-        })
-        .unwrap();
+        };
 
-        let response = schedule_graph(In(Some(params)), &mut world).unwrap();
+        let response = schedule_graph(In(params), &mut world).unwrap();
         let response = serde_json::from_value::<BrpScheduleGraphResponse>(response).unwrap();
 
         // We expect 3 edges thanks to the cached metadata: f1 -> f2, f1 -> apply_deferred -> f2

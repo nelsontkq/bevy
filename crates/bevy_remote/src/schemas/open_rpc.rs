@@ -1,12 +1,13 @@
 //! Module with trimmed down `OpenRPC` document structs.
 //! It tries to follow this standard: <https://spec.open-rpc.org>
 use bevy_platform::collections::HashMap;
+use bevy_reflect::TypeRegistry;
 use bevy_utils::default;
 use serde::{Deserialize, Serialize};
 
 use crate::RemoteMethods;
 
-use super::json_schema::JsonSchemaBevyType;
+use super::params::{method_description, method_params, method_result};
 
 /// Represents an `OpenRPC` document as defined by the `OpenRPC` specification.
 #[derive(Debug, Serialize, Deserialize)]
@@ -84,16 +85,16 @@ pub struct MethodObject {
     /// Parameters for the RPC method
     #[serde(default)]
     pub params: Vec<Parameter>,
-    // /// The expected result of the method
-    // #[serde(skip_serializing_if = "Option::is_none")]
-    // pub result: Option<Parameter>,
+    /// The expected result of the method
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<Parameter>,
     /// Additional custom extension fields.
     #[serde(flatten)]
     pub extensions: HashMap<String, serde_json::Value>,
 }
 
 /// Represents an RPC method parameter in the `OpenRPC` document.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Parameter {
     /// Parameter name
@@ -101,20 +102,31 @@ pub struct Parameter {
     /// Parameter description
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Whether the parameter must be provided.
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    pub required: bool,
     /// JSON schema describing the parameter
-    pub schema: JsonSchemaBevyType,
+    pub schema: serde_json::Value,
     /// Additional custom extension fields.
     #[serde(flatten)]
     pub extensions: HashMap<String, serde_json::Value>,
 }
 
-impl From<&RemoteMethods> for Vec<MethodObject> {
-    fn from(value: &RemoteMethods) -> Self {
-        value
-            .methods()
-            .iter()
-            .map(|e| MethodObject {
-                name: e.to_owned(),
+impl MethodObject {
+    /// Builds the `OpenRPC` method list, sorted by name.
+    pub fn for_methods(methods: &RemoteMethods, registry: &TypeRegistry) -> Vec<Self> {
+        let mut methods: Vec<_> = methods.iter().collect();
+        methods.sort_unstable_by_key(|(name, _)| *name);
+        methods
+            .into_iter()
+            .map(|(name, method)| MethodObject {
+                name: name.to_owned(),
+                description: method.params.and_then(method_description),
+                params: method
+                    .params
+                    .map(|params| method_params(params, registry))
+                    .unwrap_or_default(),
+                result: method.result.map(|result| method_result(result, registry)),
                 ..default()
             })
             .collect()

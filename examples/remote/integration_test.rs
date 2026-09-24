@@ -13,6 +13,7 @@ use anyhow::Result as AnyhowResult;
 use bevy::{
     feathers::controls::FeathersButton,
     platform::collections::HashMap,
+    reflect::{GetTypeRegistration, PartialReflect},
     remote::{
         builtin_methods::{
             BrpObserveParams, BrpQuery, BrpQueryFilter, BrpQueryParams, BrpSpawnEntityParams,
@@ -20,7 +21,7 @@ use bevy::{
             BRP_SPAWN_ENTITY_METHOD, BRP_WRITE_MESSAGE_METHOD,
         },
         http::{DEFAULT_ADDR, DEFAULT_PORT},
-        BrpRequest,
+        BrpRequest, Json,
     },
     render::view::screenshot::{Screenshot, ScreenshotCaptured},
     ui::UiGlobalTransform,
@@ -41,21 +42,21 @@ fn main() -> AnyhowResult<()> {
         &BrpSpawnEntityParams {
             components: HashMap::from([(
                 type_name::<Screenshot>().to_string(),
-                serde_json::json!({"Window": "Primary"}),
+                Json::serialize_reflect(&Screenshot::primary_window())?,
             )]),
         },
     )?;
     let screenshot_entity = &spawn_response["result"]["entity"];
 
     println!("Observing ScreenshotCaptured on entity {screenshot_entity}...");
-    let observe_response = ureq::post(&url).send_json(BrpRequest {
-        method: BRP_OBSERVE_METHOD.to_string(),
-        id: Some(serde_json::to_value(2)?),
-        params: Some(serde_json::to_value(BrpObserveParams {
+    let observe_response = ureq::post(&url).send_json(BrpRequest::new(
+        BRP_OBSERVE_METHOD,
+        2,
+        &BrpObserveParams {
             event: type_name::<ScreenshotCaptured>().to_string(),
             entity: Some(serde_json::from_value(screenshot_entity.clone())?),
-        })?),
-    })?;
+        },
+    )?)?;
 
     println!("Waiting for screenshot capture...");
     let reader = std::io::BufReader::new(observe_response.into_body().into_reader());
@@ -165,13 +166,16 @@ fn main() -> AnyhowResult<()> {
         5,
         &BrpWriteMessageParams {
             message: type_name::<WindowEvent>().to_string(),
-            value: Some(serde_json::json!({
-                "CursorMoved": {
-                    "window": window_entity,
-                    "position": [logical_x, logical_y],
-                    "delta": null
-                }
-            })),
+            value: Some(
+                serde_json::json!({
+                    "CursorMoved": {
+                        "window": window_entity,
+                        "position": [logical_x, logical_y],
+                        "delta": null
+                    }
+                })
+                .into(),
+            ),
         },
     )?;
 
@@ -184,13 +188,16 @@ fn main() -> AnyhowResult<()> {
         6,
         &BrpWriteMessageParams {
             message: type_name::<WindowEvent>().to_string(),
-            value: Some(serde_json::json!({
-                "MouseButtonInput": {
-                    "button": "Left",
-                    "state": "Pressed",
-                    "window": window_entity,
-                }
-            })),
+            value: Some(
+                serde_json::json!({
+                    "MouseButtonInput": {
+                        "button": "Left",
+                        "state": "Pressed",
+                        "window": window_entity,
+                    }
+                })
+                .into(),
+            ),
         },
     )?;
 
@@ -201,29 +208,28 @@ fn main() -> AnyhowResult<()> {
         7,
         &BrpWriteMessageParams {
             message: type_name::<WindowEvent>().to_string(),
-            value: Some(serde_json::json!({
-                "MouseButtonInput": {
-                    "button": "Left",
-                    "state": "Released",
-                    "window": window_entity,
-                }
-            })),
+            value: Some(
+                serde_json::json!({
+                    "MouseButtonInput": {
+                        "button": "Left",
+                        "state": "Released",
+                        "window": window_entity,
+                    }
+                })
+                .into(),
+            ),
         },
     )?;
 
     Ok(())
 }
 
-fn brp_request(
+fn brp_request<T: PartialReflect + GetTypeRegistration>(
     url: &str,
     method: &str,
     id: u32,
-    params: &impl serde::Serialize,
+    params: &T,
 ) -> AnyhowResult<serde_json::Value> {
-    let req = BrpRequest {
-        method: method.to_string(),
-        id: Some(serde_json::to_value(id)?),
-        params: Some(serde_json::to_value(params)?),
-    };
+    let req = BrpRequest::new(method, id, params)?;
     Ok(ureq::post(url).send_json(req)?.body_mut().read_json()?)
 }
