@@ -13,6 +13,7 @@ pub struct NamedField {
     type_info: fn() -> Option<&'static TypeInfo>,
     ty: Type,
     custom_attributes: CustomAttributes,
+    has_default: bool,
     #[cfg(feature = "reflect_documentation")]
     docs: Option<&'static str>,
 }
@@ -25,8 +26,17 @@ impl NamedField {
             type_info: T::maybe_type_info,
             ty: Type::of::<T>(),
             custom_attributes: CustomAttributes::default(),
+            has_default: false,
             #[cfg(feature = "reflect_documentation")]
             docs: None,
+        }
+    }
+
+    /// Sets whether the field has a `#[reflect(default)]` attribute.
+    pub fn with_default(self, has_default: bool) -> Self {
+        Self {
+            has_default,
+            ..self
         }
     }
 
@@ -47,6 +57,11 @@ impl NamedField {
     /// The name of the field.
     pub fn name(&self) -> &'static str {
         self.name
+    }
+
+    /// Returns `true` if the field has a `#[reflect(default)]` attribute.
+    pub fn has_default(&self) -> bool {
+        self.has_default
     }
 
     /// The [`TypeInfo`] of the field.
@@ -76,6 +91,7 @@ pub struct UnnamedField {
     type_info: fn() -> Option<&'static TypeInfo>,
     ty: Type,
     custom_attributes: CustomAttributes,
+    has_default: bool,
     #[cfg(feature = "reflect_documentation")]
     docs: Option<&'static str>,
 }
@@ -88,8 +104,17 @@ impl UnnamedField {
             type_info: T::maybe_type_info,
             ty: Type::of::<T>(),
             custom_attributes: CustomAttributes::default(),
+            has_default: false,
             #[cfg(feature = "reflect_documentation")]
             docs: None,
+        }
+    }
+
+    /// Sets whether the field has a `#[reflect(default)]` attribute.
+    pub fn with_default(self, has_default: bool) -> Self {
+        Self {
+            has_default,
+            ..self
         }
     }
 
@@ -110,6 +135,11 @@ impl UnnamedField {
     /// Returns the index of the field.
     pub fn index(&self) -> usize {
         self.index
+    }
+
+    /// Returns `true` if the field has a `#[reflect(default)]` attribute.
+    pub fn has_default(&self) -> bool {
+        self.has_default
     }
 
     /// The [`TypeInfo`] of the field.
@@ -147,5 +177,31 @@ impl Display for FieldId {
             Self::Named(name) => Display::fmt(name, f),
             Self::Unnamed(index) => Display::fmt(index, f),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Reflect, Typed};
+
+    #[test]
+    fn fields_report_reflect_default() {
+        #[derive(Reflect)]
+        struct Foo {
+            required: u32,
+            #[reflect(default)]
+            defaulted: u32,
+            #[reflect(default = "seven")]
+            computed: u32,
+        }
+
+        fn seven() -> u32 {
+            7
+        }
+
+        let info = Foo::type_info().as_struct().unwrap();
+        assert!(!info.field("required").unwrap().has_default());
+        assert!(info.field("defaulted").unwrap().has_default());
+        assert!(info.field("computed").unwrap().has_default());
     }
 }

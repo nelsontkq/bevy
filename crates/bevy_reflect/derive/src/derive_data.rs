@@ -17,7 +17,7 @@ use quote::{format_ident, quote, ToTokens};
 use syn::{token::Comma, MacroDelimiter};
 
 use crate::enum_utility::{EnumVariantOutputData, ReflectCloneVariantBuilder, VariantBuilder};
-use crate::field_attributes::CloneBehavior;
+use crate::field_attributes::{CloneBehavior, DefaultBehavior};
 use crate::generics::generate_generics;
 use bevy_macro_utils::fq_std::{FQClone, FQOption, FQResult};
 use syn::{
@@ -533,6 +533,12 @@ impl<'a> StructField<'a> {
             let custom_attributes = custom_attributes.to_tokens(bevy_reflect_path);
             info.extend(quote! {
                 .with_custom_attributes(#custom_attributes)
+            });
+        }
+
+        if !matches!(self.attrs.default, DefaultBehavior::Required) {
+            info.extend(quote! {
+                .with_default(true)
             });
         }
 
