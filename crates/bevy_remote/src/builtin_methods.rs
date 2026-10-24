@@ -157,7 +157,7 @@ pub struct BrpGetResourcesParams {
 /// and component values that match.
 ///
 /// The server responds with a [`BrpQueryResponse`].
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default, Reflect)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Reflect)]
 #[reflect(Serialize, Deserialize)]
 pub struct BrpQueryParams {
     /// The components to select.
@@ -171,11 +171,29 @@ pub struct BrpQueryParams {
     #[serde(default)]
     pub filter: BrpQueryFilter,
 
-    /// An optional flag to fail when encountering an invalid component rather
-    /// than skipping it. Defaults to false.
-    #[reflect(default)]
-    #[serde(default)]
+    /// Fail if a component path is not registered or used in the world. Defaults to true.
+    /// Use `world.list_components` to discover available component paths.
+    ///
+    /// Set to false to tolerate unavailable components: `components` and `with`
+    /// match no entities, `option` and `without` ignore them, and `has` reports false.
+    /// Known components absent from an entity still follow normal query semantics.
+    #[reflect(default = "query_strict_default")]
+    #[serde(default = "query_strict_default")]
     pub strict: bool,
+}
+
+fn query_strict_default() -> bool {
+    true
+}
+
+impl Default for BrpQueryParams {
+    fn default() -> Self {
+        Self {
+            data: BrpQuery::default(),
+            filter: BrpQueryFilter::default(),
+            strict: query_strict_default(),
+        }
+    }
 }
 
 /// `world.spawn_entity`: Creates a new entity with the given components and responds
@@ -2046,7 +2064,7 @@ fn get_component_ids(
             component_ids.push((type_id, component_id));
         } else if strict {
             return Err(anyhow!(
-                "Component `{}` isn't registered or used in the world",
+                "Component `{}` isn't registered or used in the world. Use `world.list_components` to discover available component paths.",
                 component_path
             ));
         } else {
@@ -2246,6 +2264,36 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn query_defaults_to_strict() {
+        assert!(BrpQueryParams::default().strict);
+        let params: BrpQueryParams = serde_json::from_value(serde_json::json!({
+            "data": { "components": ["unknown::Component"] }
+        }))
+        .unwrap();
+        assert!(params.strict);
+        let mut world = World::default();
+        world.init_resource::<AppTypeRegistry>();
+        let error = process_remote_query_request(In(params), &mut world).unwrap_err();
+        assert!(error.message.contains("unknown::Component"));
+        assert!(error.message.contains("world.list_components"));
+    }
+
+    #[test]
+    fn query_explicit_lenient_matches_nothing_for_unknown_required_component() {
+        let params: BrpQueryParams = serde_json::from_value(serde_json::json!({
+            "data": { "components": ["unknown::Component"] },
+            "strict": false
+        }))
+        .unwrap();
+        let mut world = World::default();
+        world.init_resource::<AppTypeRegistry>();
+        world.spawn_empty();
+        let result = process_remote_query_request(In(params), &mut world).unwrap();
+        assert_eq!(result, serde_json::json!([]));
+    }
+
     use crate::{
         cache_schedule_build_metadata,
         schemas::json_schema::{ComponentMetadata, RelationshipKind, StorageKind},

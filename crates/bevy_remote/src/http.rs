@@ -7,13 +7,15 @@
 //!
 //! Clients are expected to `POST` JSON requests to the root URL; see the `client`
 //! example for a trivial example of use.
+//!
+//! The same methods are served as Model Context Protocol tools on `/mcp`; see the [`mcp`](crate::mcp) module.
 
 #![cfg(not(target_family = "wasm"))]
 
 #[cfg(feature = "bevy_render")]
 use crate::setup_mailbox_channel;
 use crate::{
-    error_codes, BrpBatch, BrpError, BrpMessage, BrpRequest, BrpResponse, BrpResult, BrpSender,
+    error_codes, mcp, BrpBatch, BrpError, BrpMessage, BrpRequest, BrpResponse, BrpResult, BrpSender,
 };
 use anyhow::Result as AnyhowResult;
 use async_channel::{Receiver, Sender};
@@ -37,7 +39,7 @@ use hyper::{
     body::{Body, Bytes, Frame, Incoming},
     header::{HeaderName, HeaderValue},
     server::conn::http1,
-    service, Request, Response,
+    service, Method, Request, Response, StatusCode,
 };
 use serde_json::Value;
 use smol_hyper::rt::{FuturesIo, SmolTimer};
@@ -174,6 +176,12 @@ impl RemoteHttpPlugin {
         self.port = port;
         self
     }
+    /// Set the remote port that the server will listen on for the render subapp.
+    #[must_use]
+    pub fn with_render_port(mut self, render_port: u16) -> Self {
+        self.render_port = render_port;
+        self
+    }
     /// Set the extra headers that the response will include.
     ///
     /// ////// /// # Example
@@ -306,6 +314,12 @@ async fn process_request_batch(
     request_sender: &Sender<BrpMessage>,
     headers: &Headers,
 ) -> AnyhowResult<Response<BrpHttpBody>> {
+    if request.uri().path() == mcp::MCP_PATH {
+        let mut response = process_mcp_request(request, request_sender).await?;
+        response.headers_mut().extend(headers.headers.clone());
+        return Ok(response);
+    }
+
     let batch_bytes = request.into_body().collect().await?.to_bytes();
     let batch: Result<BrpBatch, _> = serde_json::from_slice(&batch_bytes);
 
@@ -427,6 +441,52 @@ async fn process_single_request(
             request.id, result,
         )))
     }
+}
+
+/// A helper function for the Bevy Remote Protocol server that handles a Model
+/// Context Protocol message coming from a client.
+async fn process_mcp_request(
+    request: Request<Incoming>,
+    request_sender: &Sender<BrpMessage>,
+) -> AnyhowResult<Response<BrpHttpBody>> {
+    let complete = |status: StatusCode, body: String| {
+        let mut response = Response::new(BrpHttpBody::Complete(Full::new(Bytes::from(body))));
+        *response.status_mut() = status;
+        response
+    };
+
+    // There is no stream of server-initiated messages to `GET`, nor a session to `DELETE`.
+    if request.method() != Method::POST {
+        let mut response = complete(StatusCode::METHOD_NOT_ALLOWED, String::new());
+        response
+            .headers_mut()
+            .insert(hyper::header::ALLOW, HeaderValue::from_static("POST"));
+        return Ok(response);
+    }
+
+    let message_bytes = request.into_body().collect().await?.to_bytes();
+    let reply = match serde_json::from_slice(&message_bytes) {
+        Ok(message) => mcp::process_message(message, request_sender).await,
+        Err(err) => Some(BrpResponse::new(
+            None,
+            Err(BrpError {
+                code: error_codes::PARSE_ERROR,
+                message: err.to_string(),
+                data: None,
+            }),
+        )),
+    };
+
+    // Notifications are accepted without a reply.
+    let Some(reply) = reply else {
+        return Ok(complete(StatusCode::ACCEPTED, String::new()));
+    };
+    let mut response = complete(StatusCode::OK, serde_json::to_string(&reply)?);
+    response.headers_mut().insert(
+        hyper::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    Ok(response)
 }
 
 struct BrpStream {

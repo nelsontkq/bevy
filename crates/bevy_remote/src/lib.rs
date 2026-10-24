@@ -570,6 +570,8 @@ pub mod builtin_methods;
 #[cfg(feature = "http")]
 pub mod http;
 mod json;
+#[cfg(all(feature = "http", not(target_family = "wasm")))]
+pub mod mcp;
 pub mod schemas;
 
 pub use json::Json;
